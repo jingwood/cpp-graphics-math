@@ -21,6 +21,7 @@
 #define FORMAT_TAG_BMP  0x20706d62
 #define FORMAT_TAG_GIF  0x20666967
 #define FORMAT_TAG_TIFF 0x66666974
+#define FORMAT_TAG_HDR  0x20726468
 
 namespace ugm {
 
@@ -33,6 +34,7 @@ enum ImageCodecFormat {
 	ICF_GIF,
 	ICF_BMP,
 	ICF_TIFF,
+	ICF_HDR,
 };
 
 bool readPNG(Image& image, Stream& stream);
@@ -42,6 +44,12 @@ void readJPEG(Image& image, FILE* file);
 bool writePNG(const Image& image, Stream& stream);
 void writeJPEG(const Image& image, Stream& stream);
 void writeJPEG(const Image& image, FILE* file);
+
+// Radiance .hdr (RGBE) writer. Keeps pixel data in linear float space so the
+// caller can deliver true HDR radiance (>1.0) without LDR clamping. RLE-
+// encoded new-format scanlines so any standard HDR viewer (and our own
+// texture loader) can read it back.
+bool writeHDR(const Image& image, Stream& stream);
 
 bool getImageFormatByExtension(const string& path, ImageCodecFormat* format);
 

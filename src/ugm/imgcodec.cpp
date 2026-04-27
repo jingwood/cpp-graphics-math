@@ -9,6 +9,7 @@
 #include <cassert>
 #include "imgcodec.h"
 
+#include <cmath>
 #include <vector>
 #include "ucm/types.h"
 
@@ -33,8 +34,11 @@ bool getImageFormatByExtension(const string& path, ImageCodecFormat* format) {
 	} else if (path.endsWith(".bmp", StringComparingFlags::SCF_CASE_INSENSITIVE)) {
 		*format = ImageCodecFormat::ICF_BMP;
 		return true;
+	} else if (path.endsWith(".hdr", StringComparingFlags::SCF_CASE_INSENSITIVE)) {
+		*format = ImageCodecFormat::ICF_HDR;
+		return true;
 	}
-	
+
 	return false;
 }
 
@@ -570,18 +574,146 @@ bool writePNG(const Image& image, Stream& stream) {
 	return true;
 }
 
+namespace {
+
+struct RGBE { unsigned char r, g, b, e; };
+
+// Convert one linear-radiance RGB triple to a Radiance shared-exponent pixel.
+// Negative samples (rare path-tracer artifacts) are clamped to zero so we
+// don't pollute the exponent calculation.
+static RGBE encodeRGBE(float r, float g, float b) {
+	if (r < 0.0f) r = 0.0f;
+	if (g < 0.0f) g = 0.0f;
+	if (b < 0.0f) b = 0.0f;
+	float m = r > g ? r : g;
+	if (b > m) m = b;
+	RGBE out;
+	if (m < 1e-32f) {
+		out.r = out.g = out.b = out.e = 0;
+		return out;
+	}
+	int e;
+	const float mant = std::frexp(m, &e);
+	const float scale = mant * 256.0f / m;
+	int ri = (int)(r * scale); if (ri > 255) ri = 255;
+	int gi = (int)(g * scale); if (gi > 255) gi = 255;
+	int bi = (int)(b * scale); if (bi > 255) bi = 255;
+	out.r = (unsigned char)ri;
+	out.g = (unsigned char)gi;
+	out.b = (unsigned char)bi;
+	out.e = (unsigned char)(e + 128);
+	return out;
+}
+
+// Adaptive RLE for one channel of a Radiance scanline. Runs of length >=4
+// are emitted as run-blocks; everything else as literal-blocks. Matches the
+// "new-format" RLE every standard HDR reader (incl. our own loader in
+// raygen/texture.cpp) expects.
+static void writeRGBEChannel(Stream& stream, const unsigned char* data, int w) {
+	int p = 0;
+	while (p < w) {
+		// Locate the next run of >= 4 identical bytes.
+		int runStart = p;
+		while (runStart < w) {
+			int runEnd = runStart;
+			while (runEnd < w - 1 && data[runEnd] == data[runEnd + 1]) runEnd++;
+			if (runEnd - runStart + 1 >= 4) break;
+			runStart = runEnd + 1;
+		}
+
+		// Emit literal segment [p .. runStart) in chunks of up to 128 bytes.
+		while (p < runStart) {
+			int chunk = runStart - p;
+			if (chunk > 128) chunk = 128;
+			unsigned char count = (unsigned char)chunk;
+			stream.write(&count, 1);
+			stream.write(data + p, chunk);
+			p += chunk;
+		}
+		if (p >= w) break;
+
+		// Emit run from runStart in chunks of up to 127 bytes.
+		int runEnd = runStart;
+		while (runEnd < w - 1 && data[runEnd] == data[runEnd + 1]) runEnd++;
+		int runLen = runEnd - runStart + 1;
+		while (runLen > 0) {
+			int chunk = runLen > 127 ? 127 : runLen;
+			unsigned char count = (unsigned char)(chunk + 128);
+			stream.write(&count, 1);
+			stream.write(&data[runStart], 1);
+			runStart += chunk;
+			runLen -= chunk;
+		}
+		p = runStart;
+	}
+}
+
+}  // namespace
+
+bool writeHDR(const Image& image, Stream& stream) {
+	const int w = image.width();
+	const int h = image.height();
+	if (w <= 0 || h <= 0) return false;
+
+	// ASCII header. FORMAT must be 32-bit_rle_rgbe; we always emit linear
+	// radiance (no gamma). -Y rows top-to-bottom, +X columns left-to-right.
+	char header[256];
+	int headerLen = snprintf(header, sizeof(header),
+		"#?RADIANCE\n"
+		"FORMAT=32-bit_rle_rgbe\n"
+		"GAMMA=1.0\n"
+		"EXPOSURE=1.0\n"
+		"\n"
+		"-Y %d +X %d\n", h, w);
+	stream.write(header, (size_t)headerLen);
+
+	// Radiance only supports new-format RLE for widths in [8, 32767].
+	// Outside that range, fall back to plain uncompressed RGBE per pixel.
+	const bool useRLE = (w >= 8 && w < 32768);
+
+	std::vector<unsigned char> scanline((size_t)w * 4);
+
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			const color4f c = image.getPixel(x, y);
+			const RGBE px = encodeRGBE(c.r, c.g, c.b);
+			scanline[x * 4 + 0] = px.r;
+			scanline[x * 4 + 1] = px.g;
+			scanline[x * 4 + 2] = px.b;
+			scanline[x * 4 + 3] = px.e;
+		}
+
+		if (useRLE) {
+			// Per-scanline marker: 0x02 0x02 (W>>8) (W&0xff).
+			unsigned char hdr[4] = { 2, 2, (unsigned char)((w >> 8) & 0xff), (unsigned char)(w & 0xff) };
+			stream.write(hdr, 4);
+
+			// Channels are written as four interleaved RLE streams.
+			std::vector<unsigned char> chan((size_t)w);
+			for (int c = 0; c < 4; c++) {
+				for (int x = 0; x < w; x++) chan[x] = scanline[x * 4 + c];
+				writeRGBEChannel(stream, chan.data(), w);
+			}
+		} else {
+			stream.write(scanline.data(), (size_t)w * 4);
+		}
+	}
+
+	return true;
+}
+
 void saveImage(const Image& image, const string& path, ImageCodecFormat format) {
-	
+
 	if (format == ImageCodecFormat::ICF_AUTO) {
 		getImageFormatByExtension(path, &format);
 	}
-	
+
 	FileStream fs(path);
 	fs.openWrite();
-	
+
 	Image image3b(PixelDataFormat::PDF_RGB, 8), image4b(PixelDataFormat::PDF_RGBA, 8);
 	const Image* saveImage = &image;
-	
+
 	switch (format) {
 		case ImageCodecFormat::ICF_JPEG:
 			if (image.getColorComponents() > 3 || image.getBitDepth() != 8) {
@@ -590,7 +722,7 @@ void saveImage(const Image& image, const string& path, ImageCodecFormat format) 
 			}
 			writeJPEG(*saveImage, fs.getHandler());
 			break;
-		
+
 		case ImageCodecFormat::ICF_PNG:
 			if (image.getBitDepth() != 8) {
 				Image::copy(image, image4b);
@@ -598,11 +730,16 @@ void saveImage(const Image& image, const string& path, ImageCodecFormat format) 
 			}
 			writePNG(*saveImage, fs);
 			break;
-		
+
+		case ImageCodecFormat::ICF_HDR:
+			// HDR consumes float radiance directly — no LDR conversion.
+			writeHDR(image, fs);
+			break;
+
 		default:
 			break;
 	}
-	
+
 	fs.close();
 }
 
@@ -635,6 +772,10 @@ void saveImage(const Image& image, Stream& stream, ImageCodecFormat format) {
 		
 		case ImageCodecFormat::ICF_PNG:
 			writePNG(image, stream);
+			break;
+
+		case ImageCodecFormat::ICF_HDR:
+			writeHDR(image, stream);
 			break;
 	}
 }
